@@ -8,8 +8,8 @@
              script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com https://*.supabase.co;
              style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
              font-src 'self' https://fonts.gstatic.com data:;
-             connect-src 'self' blob: https://jeiweoaqvaldgkgdgzvu.supabase.co https://*.supabase.co wss://*.supabase.co;
-             img-src 'self' blob: data:;
+             connect-src 'self' blob: https://jeiweoaqvaldgkgdgzvu.supabase.co https://*.supabase.co wss://*.supabase.co https://api.github.com https://raw.githubusercontent.com;
+             img-src 'self' blob: data: https://raw.githubusercontent.com;
              media-src 'self' blob: data:;
              object-src 'none';
              base-uri 'self';">
@@ -3085,8 +3085,105 @@ function updateNameSpriteData(sp, label, bounty){
 // ============================================================================
 //  XP & LEVEL SYSTEM
 // ============================================================================
-let playerXP    = 0;
-let playerLevel = 0;
+
+// ============================================================================
+//  PROTECTED GAME VALUES — XOR obfuscation + dual-shadow tamper detection
+// ============================================================================
+// Each protected variable is stored as two XOR-encrypted copies using different
+// session-random keys. Keys live inside a closure — inaccessible from the console.
+// On every read, both shadow copies are decrypted and compared. Mismatch = tamper.
+//
+// All references to coins/myHp/playerXP etc. in game code resolve to window.X
+// via the scope chain (no 'let' binding exists), so 'coins = 99999' in DevTools
+// goes through our setter. The setter clamps values and reports anomalies.
+//
+// ⚠  Limitation: this is a defence-in-depth layer, not a silver bullet.
+//    Since code is in plain HTML, the algorithm is readable. The XOR keys
+//    themselves are per-session and inaccessible from the console. Server-side
+//    validation on save remains the primary protection for persistent values.
+// ============================================================================
+(function _installProtectedValues() {
+  'use strict';
+
+  // Two session-unique XOR keys — never exposed on window
+  const _K1 = ((Math.random() * 0x7FFFFFFF) | 0) ^ 0x5A3C9F21;
+  const _K2 = ((Math.random() * 0x7FFFFFFF) | 0) ^ 0x8B7E4D62;
+
+  let _reportCooldown = 0;
+
+  function _enc(v, k) { return ((Math.round(v) | 0) ^ k) >>> 0; }
+  function _dec(e, k) { return ((e ^ k) | 0); }
+
+  function _report(field, detail) {
+    const now = Date.now();
+    if (now < _reportCooldown) return;
+    _reportCooldown = now + 30000; // once per 30s
+    console.warn('[ANTICHEAT] Protected value tamper — ' + field + ': ' + detail);
+    // callEdgeFn may not exist yet at parse time — check at call time
+    if (typeof callEdgeFn === 'function' && window.accountUsername) {
+      callEdgeFn('anticheat', {
+        username: window.accountUsername,
+        type:     'value_tamper',
+        field:    field,
+        detail:   String(detail)
+      });
+    }
+  }
+
+  function _make(name, initial, min, max) {
+    let _sA = _enc(initial, _K1);
+    let _sB = _enc(initial, _K2);
+
+    function _read() {
+      const a = _dec(_sA, _K1);
+      const b = _dec(_sB, _K2);
+      if (a !== b) {
+        _report(name + '.shadow', 'sA=' + a + ' sB=' + b);
+        // Restore both from sB (second copy harder to find without key)
+        _sA = _enc(b, _K1);
+        return b;
+      }
+      return a;
+    }
+
+    function _write(raw) {
+      let v = Math.round(raw);
+      if (v < min) { _report(name + '.underflow', v); v = min; }
+      if (v > max) { _report(name + '.overflow',  v); v = max; }
+      _sA = _enc(v, _K1);
+      _sB = _enc(v, _K2);
+    }
+
+    Object.defineProperty(window, name, {
+      get()    { return _read(); },
+      set(val) {
+        const old = _read();
+        // Suspicious upward coin jump by non-admin in one assignment
+        if (name === 'coins' && (val - old) > 100000 && !window.isAdmin) {
+          _report('coins.jump', '+' + (val - old) + ' in one step');
+          val = old + 100000; // clamp the jump, don't silently accept
+        }
+        _write(val);
+      },
+      configurable: false,
+      enumerable:   true
+    });
+
+    _write(initial); // initialise shadow copies
+  }
+
+  // ─── Install all protected values ────────────────────────────────────────
+  _make('coins',       0,   0,       5000000); // max ever seen legitimately
+  _make('myHp',        100, 0,       100200);  // MAX_HP + max maxHpBonus
+  _make('playerXP',    0,   0,       50000000);
+  _make('playerLevel', 0,   0,       500);
+  _make('maxHpBonus',  0,   0,       500);     // shop upgrades × 25
+  _make('kills',       0,   0,       999999);
+  _make('deaths',      0,   0,       999999);
+  _make('pvpKills',    0,   0,       999999);
+})();
+
+// playerXP and playerLevel are now window-protected (see _installProtectedValues above)
 const XP_PER_TIER = [25, 60, 130, 280, 600]; // index matches ZOMBIE_TIERS
 
 function xpToLevel(xp){ return Math.floor(Math.sqrt(xp/50)); }
@@ -3866,6 +3963,7 @@ function enterCar(parked){
   // Release pointer lock — camera moves freely in 3rd person
   document.exitPointerLock();
   document.getElementById('click-hint').style.display='none';
+  if(typeof _resetSpeedChecker==='function') _resetSpeedChecker();
 }
 function exitCar(){
   if(!inCar || !activeCar) return;
@@ -3886,6 +3984,7 @@ function exitCar(){
   document.getElementById('car-hud').style.display='none';
   document.getElementById('car-exit-hint').style.display='none';
   renderer.domElement.requestPointerLock();
+  if(typeof _resetSpeedChecker==='function') _resetSpeedChecker();
 }
 
 function updateCar(){
@@ -4275,6 +4374,7 @@ const ME_TRACK_END_Z = MZ - MD/2 + 4; // where train stops inside museum bay
 let inMemeExpress = false;
 let memeExpressT   = 0;      // 0 = at station, 1 = at museum
 let memeExpressDir = 0;      // 0 = stopped, 1 = going to museum, -1 = returning
+let _inMemeMuseumArea = false; // true while player is inside the museum (bypasses world border)
 const ME_SPEED = 0.0022;     // ~450 frames ≈ 7.5s ride
 let memeExpressMesh   = null;
 let _memeTexturesBuilt = false;
@@ -4486,7 +4586,7 @@ function _makeMemeExpressLocomotive() {
 // Place meme frame meshes on museum walls (textures loaded later)
 function _placeMemeFrames(bx, bz, hw, hd) {
   const frameW = 2.2, frameH = 1.65;
-  const padH   = 0.2;  // gap between frame edge and wall
+  const padH   = 0.4;  // must be > wt/2 (0.3) to clear the wall inner surface
   const rowYs  = [2.0, 4.1, 6.2];
   const spacingH = 2.85;
   const frameMat = new THREE.MeshLambertMaterial({ color: 0x222222, side: THREE.DoubleSide });
@@ -4544,30 +4644,85 @@ function _placeMemeFrames(bx, bz, hw, hd) {
   scene.userData.memeSlots = memeSlots;
 }
 
-// Lazy-load meme textures for meshes close to camera
-function _loadNearbyMemeTextures() {
+// ── Meme texture system (loaded from GitHub repo) ────────────────────────
+const _MEME_REPO  = 'PhantomOverrideX/open-world-online';
+const _MEME_BRANCH = 'memes'; // branch containing the images
+let _memeImageURLs = [];
+let _memeTexturesApplied = false;
+
+function _applyMemeTextures() {
   const slots = scene.userData.memeSlots;
-  if (!slots || !MEME_B64) return;
-  const loader = new THREE.TextureLoader();
-  for (const mesh of slots) {
-    if (mesh.userData.textureLoaded) continue;
-    const dsq = camera.position.distanceToSquared(mesh.position);
-    if (dsq < 1600) { // within 40 units
-      const idx = mesh.userData.memeIdx;
-      if (idx < MEME_B64.length) {
-        const tex = loader.load('data:image/jpeg;base64,' + MEME_B64[idx]);
-        tex.minFilter = THREE.LinearFilter; // no mipmaps — saves VRAM
-        mesh.material = new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide });
-        mesh.userData.textureLoaded = true;
-      }
-    }
-  }
+  console.log('[Memes] _applyMemeTextures called — slots:', slots ? slots.length : 'null', 'urls:', _memeImageURLs.length, 'applied:', _memeTexturesApplied);
+  if (!slots || !_memeImageURLs.length || _memeTexturesApplied) return;
+  _memeTexturesApplied = true;
+  console.log('[Memes] Applying', Math.min(slots.length, _memeImageURLs.length), 'textures...');
+  slots.forEach((mesh, i) => {
+    if (i >= _memeImageURLs.length) return;
+    const url = _memeImageURLs[i];
+    const img = new Image();
+    img.onload = () => {
+      console.log('[Memes] img', i, 'loaded, size:', img.naturalWidth, 'x', img.naturalHeight);
+      const canvas = document.createElement('canvas');
+      canvas.width  = img.naturalWidth  || img.width  || 320;
+      canvas.height = img.naturalHeight || img.height || 240;
+      canvas.getContext('2d').drawImage(img, 0, 0);
+      const tex = new THREE.CanvasTexture(canvas);
+      tex.minFilter = THREE.LinearFilter;
+      mesh.material = new THREE.MeshBasicMaterial({ map: tex, side: THREE.DoubleSide });
+      if (i === 0) console.log('[Memes] First mesh position:', mesh.position, 'visible:', mesh.visible);
+    };
+    img.onerror = (e) => console.error('[Memes] img', i, 'FAILED to load:', url, e);
+    img.src = url;
+  });
+  const btn = document.getElementById('meme-load-btn');
+  if (btn) { btn.textContent = '✓ ' + _memeImageURLs.length + ' Memes'; btn.style.background = '#004400'; }
+}
+
+function _fetchMemesFromGitHub() {
+  const btn = document.getElementById('meme-load-btn');
+  if (btn) btn.textContent = '⏳ Fetching...';
+  const apiURL = `https://api.github.com/repos/${_MEME_REPO}/contents/?ref=${_MEME_BRANCH}`;
+  fetch(apiURL)
+    .then(r => r.json())
+    .then(files => {
+      if (!Array.isArray(files)) throw new Error(files.message || 'Not an array');
+      const imgs = files
+        .filter(f => f.type === 'file' && /\.(jpe?g|png|gif|webp)$/i.test(f.name))
+        .sort((a, b) => a.name.localeCompare(b.name, undefined, {numeric: true}));
+      if (!imgs.length) throw new Error('No images found in branch');
+      if (btn) btn.textContent = `⏳ 0/${imgs.length}`;
+      let loaded = 0;
+      // Fetch each image as a blob to avoid CORS texture issues
+      Promise.all(imgs.map(f =>
+        fetch(f.download_url)
+          .then(r => r.blob())
+          .then(blob => {
+            loaded++;
+            if (btn) btn.textContent = `⏳ ${loaded}/${imgs.length}`;
+            return URL.createObjectURL(blob);
+          })
+      )).then(urls => {
+        _memeImageURLs.forEach(u => URL.revokeObjectURL(u));
+        _memeImageURLs = urls;
+        _memeTexturesApplied = false;
+        _applyMemeTextures();
+      });
+    })
+    .catch(err => {
+      console.warn('[MemeMuseum] GitHub fetch failed:', err.message);
+      if (btn) btn.textContent = '⚠ Load Failed';
+    });
+}
+
+function _loadNearbyMemeTextures(loadAll) {
+  // textures applied once on arrival, nothing to do per-frame
 }
 
 // ── Board / exit ──────────────────────────────────────────────────────────
 function boardMemeExpress(goingToMuseum) {
   if (inMemeExpress) return;
   inMemeExpress  = true;
+  _inMemeMuseumArea = false; // leaving museum area
   memeExpressDir = goingToMuseum ? 1 : -1;
   document.exitPointerLock();
   document.getElementById('car-hud').style.display = 'block';
@@ -4578,25 +4733,34 @@ function boardMemeExpress(goingToMuseum) {
 }
 
 function _arriveAtMuseum() {
-  // Place player inside museum entrance
-  inMemeExpress = false; memeExpressDir = 0;
+  // Keep inMemeExpress=true during the fade so the speed checker stays exempted.
+  // Only clear it AFTER camera is repositioned and speed checker is reset.
+  memeExpressDir = 0;
   _meFade(1, () => {
     camera.position.set(MX, GROUND_Y, MZ - MD/2 + 8);
     pitch = 0; yaw = 0;
+    inMemeExpress = false;
+    _inMemeMuseumArea = true;
+    camera.far = 1200; camera.updateProjectionMatrix();
     if (typeof _resetSpeedChecker === 'function') _resetSpeedChecker();
     document.getElementById('car-hud').style.display = 'none';
     document.getElementById('car-exit-hint').style.display = 'none';
-    _meFade(0, () => { renderer.domElement.requestPointerLock(); });
     _memeNearMuseum = true;
+    if (_memeImageURLs.length > 0) { _memeTexturesApplied = false; setTimeout(() => _applyMemeTextures(), 100); }
+    else setTimeout(() => _fetchMemesFromGitHub(), 200);
+    _meFade(0, () => { renderer.domElement.requestPointerLock(); });
     addChatMessage('', '// ✦ WELCOME TO THE MEME MUSEUM ✦ //', false, true);
   });
 }
 
 function _arriveAtStation() {
-  inMemeExpress = false; memeExpressDir = 0;
+  memeExpressDir = 0;
   _meFade(1, () => {
     camera.position.set(MS_X + 2, GROUND_Y, MS_Z + 3);
     pitch = 0; yaw = Math.PI;
+    inMemeExpress = false;
+    _inMemeMuseumArea = false;
+    camera.far = 160; camera.updateProjectionMatrix(); // restore normal draw distance
     if (typeof _resetSpeedChecker === 'function') _resetSpeedChecker();
     document.getElementById('car-hud').style.display = 'none';
     document.getElementById('car-exit-hint').style.display = 'none';
@@ -4747,6 +4911,7 @@ function boardTrain(carIdx){
   document.getElementById('car-exit-hint').style.display='block';
   document.exitPointerLock();
   document.getElementById('click-hint').style.display='none';
+  if(typeof _resetSpeedChecker==='function') _resetSpeedChecker();
   addChatMessage('','// 🚂 BOARDED TRAIN — [F] TO EXIT //',false,true);
 }
 
@@ -4760,6 +4925,7 @@ function exitTrain(){
   document.getElementById('car-hud').style.display='none';
   document.getElementById('car-exit-hint').style.display='none';
   renderer.domElement.requestPointerLock();
+  if(typeof _resetSpeedChecker==='function') _resetSpeedChecker();
 }
 
 // ============================================================================
@@ -4873,6 +5039,7 @@ function mountHorse(parked){
   document.getElementById('car-hud-name').textContent=parked.def.name;
   document.exitPointerLock();
   document.getElementById('click-hint').style.display='none';
+  if(typeof _resetSpeedChecker==='function') _resetSpeedChecker();
 }
 
 function dismountHorse(){
@@ -4887,6 +5054,7 @@ function dismountHorse(){
   document.getElementById('car-hud').style.display='none';
   document.getElementById('car-exit-hint').style.display='none';
   renderer.domElement.requestPointerLock();
+  if(typeof _resetSpeedChecker==='function') _resetSpeedChecker();
 }
 
 function updateHorse(){
@@ -5020,7 +5188,8 @@ function refreshHorseDealerUI(){
 // ============================================================================
 //  PLAYER STATE
 // ============================================================================
-let myHp=100, kills=0, deaths=0, pvpKills=0, dead=false;
+// myHp, kills, deaths, pvpKills are window-protected (see _installProtectedValues above)
+let dead=false;
 const MAX_HP=100;
 let myName = ''; // set after login
 let accountUsername = ''; // the login username (separate from callsign)
@@ -5495,6 +5664,8 @@ async function authDeploy(){
   const MAX_LEGIT_HP         = 200100; // MAX_HP + max maxHpBonus
 
   setInterval(function _integrityWatch(){
+    // Admins can legitimately set any value via the console — skip all clamps for them.
+    if(_isAdminPrivate) return;
     // Clamp damage multiplier
     if(typeof damageMultiplier === 'number' && damageMultiplier > MAX_LEGIT_DMG_MULT){
       damageMultiplier = MAX_LEGIT_DMG_MULT;
@@ -5542,6 +5713,13 @@ async function authDeploy(){
       try{ window.shoot = _origShoot; }catch(e){}
       console.warn('[ANTICHEAT] shoot override detected');
     }
+    // Fly hack: if _flyMode is true but player is neither admin nor has Red Bull, kill it.
+    // This check always runs regardless of admin status — admins have legitimate fly via
+    // _setFlyMode(), so if _flyModePrivate is true and they're NOT admin, it's a hack.
+    if(_flyModePrivate && !_isAdminPrivate && !redBullActive){
+      _flyModePrivate = false;
+      console.warn('[ANTICHEAT] fly hack detected and disabled');
+    }
     // Detect if callEdgeFn has been replaced (would break all server communication)
     if(typeof callEdgeFn !== 'function' || callEdgeFn.toString() !== _origCallEdgeFn.toString()){
       try{ window.callEdgeFn = _origCallEdgeFn; }catch(e){}
@@ -5552,9 +5730,6 @@ async function authDeploy(){
       try{ window.openAdminConsole = _origOpenAdminConsole; }catch(e){}
       console.warn('[ANTICHEAT] openAdminConsole override detected');
     }
-    // Anti-debug: measure how long this interval actually took.
-    // If DevTools is paused at a breakpoint, the gap will be huge.
-    // Flag it but don't kick — just log for server-side correlation.
   }, 3000);
 
   // ── Position delta speed-hack detector ──────────────────────────────────────
@@ -5577,7 +5752,7 @@ async function authDeploy(){
   };
 
   setInterval(function _speedCheck(){
-    if(dead || paused || inCar || onHorse) return;
+    if(dead || paused || inCar || onHorse || inTrain || (typeof inMemeExpress!=='undefined'&&inMemeExpress)) return;
     const now = Date.now();
     const dt  = (now - _lastPosTime) / 1000;
     if(dt < 0.4) { _lastPosTime = now; return; } // too short to measure
@@ -7478,10 +7653,10 @@ function shoot() {
 // ============================================================================
 //  COIN + ZOMBIE SYSTEM
 // ============================================================================
-let coins = 0;
+// coins is window-protected (see _installProtectedValues above)
 let damageMultiplier = 1.0; // shop upgrade: higher caliber
 let nukeOwned = false; // one-time purchase
-let maxHpBonus = 0;         // shop upgrade: max HP increase
+// maxHpBonus is window-protected (see _installProtectedValues above)
 
 // ── Hardened economy functions ───────────────────────────────────────────────
 // Per-call and rolling-window caps so console tricks like addCoins(999999)
@@ -8554,6 +8729,7 @@ function tickRedBull(){
   if(redBullTimer <= 0){
     redBullActive = false;
     redBullTimer  = 0;
+    if(_flyMode && !isAdmin){ _setFlyMode(false); } // kill fly if only had it via Red Bull
     // Float back to ground over 60 frames
     let landTick=0;
     function landStep(){
@@ -9071,16 +9247,29 @@ function showHitMarker(){
 //  JUMP & MOVEMENT
 // ============================================================================
 // Admin fly — double-tap space to toggle
-let _flyMode = false;
+// Sealed with defineProperty so `_flyMode = true` in DevTools has no effect.
+let _flyModePrivate = false;
+Object.defineProperty(window, '_flyMode', {
+  get: () => _flyModePrivate,
+  set: () => { /* sealed — only internal _setFlyMode() can change this */ },
+  configurable: false,
+  enumerable: false,
+});
+function _setFlyMode(val) {
+  // Guard: only allow fly if admin or Red Bull is currently active
+  if(val && !_isAdminPrivate && !(typeof redBullActive !== 'undefined' && redBullActive)) return;
+  _flyModePrivate = !!val;
+}
 let _lastSpaceTime = 0;
 function tryJump(){
   if(dead) return;
   const now = performance.now();
-  if(isAdmin && now - _lastSpaceTime < 300){
-    // Double-tap — toggle fly mode
-    _flyMode = !_flyMode;
+  if((isAdmin || redBullActive) && now - _lastSpaceTime < 300){
+    // Double-tap — toggle fly mode (admin or Red Bull only)
+    _setFlyMode(!_flyMode);
     velY = 0;
-    addChatMessage('','// [ADMIN] FLY MODE: '+(_flyMode?'ON':'OFF')+' //',false,true);
+    const _flyTag = isAdmin ? '[ADMIN]' : '[RED BULL]';
+    addChatMessage('','// '+_flyTag+' FLY MODE: '+(_flyMode?'ON':'OFF')+' //',false,true);
   } else if(onGround){
     velY = (HC.hacks.superJump.on ? JUMP_FORCE * 1.4 : JUMP_FORCE) * HC._hplJumpMult;
     onGround = false;
@@ -9154,7 +9343,12 @@ function updateMovement(){
   if(keys['KeyA']||keys['ArrowLeft'])  _np.addScaledVector(_rgt,-spd);
   if(keys['KeyD']||keys['ArrowRight']) _np.addScaledVector(_rgt, spd);
   _np.x=Math.max(-250,Math.min(250,_np.x));
-  _np.z=Math.max(-320,Math.min(380,_np.z));
+  if (!_inMemeMuseumArea) {
+    _np.z=Math.max(-320,Math.min(380,_np.z));
+  } else {
+    // Inside museum — allow full z range, but keep within museum bounds
+    _np.z=Math.max(MZ-MD/2-2,Math.min(MZ+MD/2+2,_np.z));
+  }
 
   _tx.copy(camera.position); _tx.x=_np.x;
   if(!checkCollision(_tx)) camera.position.x=_np.x;
@@ -9466,7 +9660,7 @@ function updateHUD(){
 // ============================================================================
 function takeDamage(amt){
   if(dead) return;
-  if(_inShopBuilding() || shopOpen) return; // god-mode inside shop or while shop UI is open
+  if(_inShopBuilding() || shopOpen || inMemeExpress) return; // god-mode inside shop or while shop UI is open
   // Military vehicle armor reduction
   if(inCar && activeCar && activeCar.def.damageReduction) amt = Math.round(amt * (1 - activeCar.def.damageReduction));
   if(amt <= 0) return;
@@ -9494,7 +9688,7 @@ function safeSpawnPos(){
   return {x:0, z:-20};
 }
 function respawn(){
-  myHp=MAX_HP+maxHpBonus; dead=false; velY=0; onGround=true; _flyMode=false;
+  myHp=MAX_HP+maxHpBonus; dead=false; velY=0; onGround=true; _setFlyMode(false);
   const sp=safeSpawnPos();
   camera.position.set(sp.x, GROUND_Y, sp.z);
   _domDmsg.style.display='none';
@@ -10136,18 +10330,14 @@ function animate(){
   if(document.hidden) return; // don't render when tab is hidden
 
   // ── In-frame integrity clamps ──────────────────────────────────────────
-  // These run every frame and silently correct cheated values in real-time,
-  // before they can be rendered or used in any calculation.
-  // Hard limits mirror the save-state Edge Function — anything above these
-  // ceilings is physically impossible through normal gameplay.
-  // Clamp to ceilings — never zero out legitimate values.
-  // Caps are set at ~10x what 800 upgrades gives, so legitimate high-level
-  // players are never affected, but console cheats like damageMultiplier=99999 are caught.
-  if(damageMultiplier > 2000.0) damageMultiplier = 2000.0;  // 800 upgrades = 201.0
-  if(maxHpBonus > 200000)       maxHpBonus       = 200000;  // 800 upgrades = 20000
-  const _maxHp = 100 + maxHpBonus;
-  if(myHp > _maxHp + 1)         myHp             = _maxHp;
-  if(coins < 0)                 coins            = 0;
+  // Skip for admins — they can legitimately set any value via the console.
+  if(!_isAdminPrivate){
+    if(damageMultiplier > 2000.0) damageMultiplier = 2000.0;
+    if(maxHpBonus > 200000)       maxHpBonus       = 200000;
+    const _maxHp = 100 + maxHpBonus;
+    if(myHp > _maxHp + 1)         myHp             = _maxHp;
+    if(coins < 0)                 coins            = 0;
+  }
   // ────────────────────────────────────────────────────────────────────────
 
   updateMovement();
@@ -10286,6 +10476,7 @@ animate();
   <div id="car-dealer-close" onclick="closeCarDealer()">&nbsp;<br>[ ESC ] — CLOSE</div>
 </div>
 <!-- CAR HUD -->
+<button id="meme-load-btn" onclick="_memeTexturesApplied=false;_fetchMemesFromGitHub()" style="position:fixed;bottom:12px;right:12px;z-index:3000;background:#001a00;color:#00cc44;border:1px solid #006622;font-family:'Orbitron',monospace;font-size:10px;padding:5px 10px;cursor:pointer;letter-spacing:1px;opacity:0.75;">🖼 Load Memes</button>
 <div id="car-hud"><div id="car-hud-name">STANDARD</div><div id="car-hud-speed">0 km/h</div></div>
 <div id="car-exit-hint">[ F ] EXIT VEHICLE / DISMOUNT</div>
 
